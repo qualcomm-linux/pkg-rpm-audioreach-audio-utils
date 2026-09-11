@@ -1,0 +1,197 @@
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+# SPDX-License-Identifier: BSD-3-Clause
+# =============================================================================
+# Update Source
+# =============================================================================
+# Manually-triggered workflow that bumps the package to a newly created tag on
+# the upstream SRC repo (the project referenced by the spec's `URL:` field).
+#
+# Given a tag, it:
+#   1. Resolves the tag to its commit SHA and commit date on the SRC repo.
+#   2. Updates %global commit / %global commitdate (and Release) in the spec.
+#   3. Downloads the resulting Source0 tarball and refreshes the `sources`
+#      checksum file.
+#   4. Adds a %changelog entry.
+#   5. Opens a pull request against this branch with the changes.
+#
+# =============================================================================
+name: Update Source
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag created on the SRC repo (see spec URL:) to update to, e.g. v1.2.3'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  update-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Locate spec file
+        id: spec
+        run: |
+          set -euo pipefail
+          SPEC_FILE=$(find . -maxdepth 1 -name '*.spec' -printf '%f\n')
+          if [ -z "${SPEC_FILE}" ]; then
+            echo "No *.spec file found at repo root" >&2
+            exit 1
+          fi
+          echo "file=${SPEC_FILE}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve SRC repo from spec URL
+        id: repo
+        run: |
+          set -euo pipefail
+          SRC_REPO=$(awk -F'https://github.com/' '/^URL:/{gsub(/[[:space:]]+$/,"",$2); print $2}' "${{ steps.spec.outputs.file }}")
+          if [ -z "${SRC_REPO}" ]; then
+            echo "Could not determine SRC repo from spec's URL: field" >&2
+            exit 1
+          fi
+          echo "repo=${SRC_REPO}" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve tag to commit SHA and date
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SRC_REPO: ${{ steps.repo.outputs.repo }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          SHA=$(git ls-remote "https://github.com/${SRC_REPO}.git" "refs/tags/${TAG}" | awk '{print $1}')
+          if [ -z "${SHA}" ]; then
+            echo "Tag '${TAG}' not found on ${SRC_REPO}" >&2
+            exit 1
+          fi
+
+          # Annotated tags point at the tag object; peel to the underlying commit.
+          PEELED=$(git ls-remote "https://github.com/${SRC_REPO}.git" "refs/tags/${TAG}^{}" | awk '{print $1}')
+          [ -n "${PEELED}" ] && SHA="${PEELED}"
+
+          DATE=$(gh api "repos/${SRC_REPO}/commits/${SHA}" --jq '.commit.committer.date' | cut -dT -f1 | tr -d '-')
+
+          echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+          echo "shortsha=${SHA:0:8}" >> "$GITHUB_OUTPUT"
+          echo "date=${DATE}" >> "$GITHUB_OUTPUT"
+
+      - name: Update spec and sources
+        id: bump
+        env:
+          SPEC_FILE: ${{ steps.spec.outputs.file }}
+          SRC_REPO: ${{ steps.repo.outputs.repo }}
+          TAG: ${{ inputs.tag }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          SHORTSHA: ${{ steps.resolve.outputs.shortsha }}
+          COMMITDATE: ${{ steps.resolve.outputs.date }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import datetime
+          import os
+          import re
+
+          spec_file = os.environ["SPEC_FILE"]
+          sha = os.environ["SHA"]
+          shortsha = os.environ["SHORTSHA"]
+          commitdate = os.environ["COMMITDATE"]
+          tag = os.environ["TAG"]
+
+          with open(spec_file) as f:
+              spec = f.read()
+
+          spec, n_commit = re.subn(
+              r"^%global commit(\s+)\S+$",
+              lambda m: f"%global commit{m.group(1)}{sha}",
+              spec, count=1, flags=re.MULTILINE,
+          )
+          spec, n_date = re.subn(
+              r"^%global commitdate(\s+)\S+$",
+              lambda m: f"%global commitdate{m.group(1)}{commitdate}",
+              spec, count=1, flags=re.MULTILINE,
+          )
+          if n_commit != 1 or n_date != 1:
+              raise SystemExit("Could not find %global commit / %global commitdate lines in spec")
+
+          version = f"0^{commitdate}git{shortsha}"
+
+          spec, n_release = re.subn(
+              r"^(Release:\s+)\S+$",
+              r"\g<1>1%{?dist}",
+              spec, count=1, flags=re.MULTILINE,
+          )
+          if n_release != 1:
+              raise SystemExit("Could not find Release: line in spec")
+
+          name_match = re.search(r"^Name:\s+(\S+)$", spec, flags=re.MULTILINE)
+          if not name_match:
+              raise SystemExit("Could not find Name: line in spec")
+          name = name_match.group(1)
+
+          today = datetime.datetime.now(datetime.timezone.utc).strftime("%a %b %d %Y")
+          src_repo = os.environ["SRC_REPO"]
+          changelog_entry = (
+              f"* {today} Qualcomm Linux <quic_linux@quicinc.com> - {version}-1\n"
+              f"- Update to {src_repo} tag {tag} ({shortsha})\n\n"
+          )
+          spec, n_changelog = re.subn(
+              r"^%changelog\n",
+              "%changelog\n" + changelog_entry,
+              spec, count=1, flags=re.MULTILINE,
+          )
+          if n_changelog != 1:
+              raise SystemExit("Could not find %changelog section in spec")
+
+          with open(spec_file, "w") as f:
+              f.write(spec)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"name={name}\n")
+              f.write(f"version={version}\n")
+          PYEOF
+
+      - name: Refresh sources checksum
+        env:
+          SRC_REPO: ${{ steps.repo.outputs.repo }}
+          SHA: ${{ steps.resolve.outputs.sha }}
+          NAME: ${{ steps.bump.outputs.name }}
+          VERSION: ${{ steps.bump.outputs.version }}
+        run: |
+          set -euo pipefail
+          TARBALL="${NAME}-${VERSION}.tar.gz"
+          URL="https://github.com/${SRC_REPO}/archive/${SHA}/${TARBALL}"
+          curl -fSL -o "${TARBALL}" "${URL}"
+          sha512sum --tag "${TARBALL}" > sources
+          rm -f "${TARBALL}"
+
+      - name: Open pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: |
+            ${{ steps.bump.outputs.name }}: update to ${{ steps.repo.outputs.repo }}@${{ inputs.tag }}
+
+            Update %global commit/%global commitdate to ${{ steps.resolve.outputs.shortsha }}
+            (tag ${{ inputs.tag }}) and refresh the sources checksum.
+          branch: update-source/${{ inputs.tag }}
+          delete-branch: true
+          title: "${{ steps.bump.outputs.name }}: update to ${{ steps.repo.outputs.repo }}@${{ inputs.tag }}"
+          body: |
+            Bumps `${{ steps.bump.outputs.name }}` to [`${{ inputs.tag }}`](https://github.com/${{ steps.repo.outputs.repo }}/releases/tag/${{ inputs.tag }}) on `${{ steps.repo.outputs.repo }}`.
+
+            - Commit: `${{ steps.resolve.outputs.sha }}`
+            - New version: `${{ steps.bump.outputs.version }}`
+
+            Opened automatically by the **Update Source** workflow (triggered by @${{ github.actor }}).
+          labels: automated-pr
