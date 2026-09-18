@@ -25,7 +25,7 @@ AudioReach audio route library (libaudioroute) for configuring
 audio routing on Qualcomm platforms.
 
 %prep
-%autosetup -n %{name}-%{version}
+%autosetup -n %{name}-%{commit}
 
 %build
 pushd audio-route
