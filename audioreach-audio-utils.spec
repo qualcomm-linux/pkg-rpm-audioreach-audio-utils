@@ -1,10 +1,10 @@
 %global debug_package %{nil}
 
 Name:           audioreach-audio-utils
-Version:        1.0.1
+Version:        1.1.1
 Release:        1%{?dist}
 Summary:        AudioReach audio route library
-License:        BSD-3-Clause-Clear
+License:        BSD-3-Clause
 URL:            https://github.com/AudioReach/audioreach-audio-utils
 Source0:        %{url}/archive/refs/tags/v%{version}.tar.gz#/%{name}-%{version}.tar.gz
 
@@ -57,6 +57,11 @@ find %{buildroot} -name '*.la' -delete
 %{_libdir}/pkgconfig/audioroute.pc
 
 %changelog
+* Tue Oct 27 2026 Febin Francis <ffrancis@qti.qualcomm.com> - 1.1.1-1
+- Update to 1.1.1
+- Link libaudioroute against expat
+- Relicense Qualcomm changes to BSD-3-Clause
+
 * Fri Sep 25 2026 Chiluka Rohith <rchiluka@qti.qualcomm.com> - 1.0.1-1
 - Build from the upstream v1.0.1 release tag instead of a pre-1.0.0
   commit so the packaged version matches the sources
